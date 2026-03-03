@@ -25,7 +25,7 @@ ARG BUILD_FROM
 FROM $BUILD_FROM
 
 # Install MQTT client and jq for JSON handling
-RUN apk add --no-cache mosquitto-clients jq
+RUN apk add --no-cache mosquitto-clients jq curl
 
 # Run as root for simplicity
 USER root

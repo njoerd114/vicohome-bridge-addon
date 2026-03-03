@@ -159,11 +159,14 @@ ensure_discovery_published() {
   local motion_topic="${BASE_TOPIC}/${safe_id}/motion"
   local telemetry_topic="${BASE_TOPIC}/${safe_id}/telemetry"
 
+  local snapshot_topic="${BASE_TOPIC}/${safe_id}/snapshot"
+
   local sensor_topic="homeassistant/sensor/${device_ident}_last_event/config"
   local motion_config_topic="homeassistant/binary_sensor/${device_ident}_motion/config"
   local battery_config_topic="homeassistant/sensor/${device_ident}_battery/config"
   local wifi_config_topic="homeassistant/sensor/${device_ident}_wifi/config"
   local online_config_topic="homeassistant/binary_sensor/${device_ident}_online/config"
+  local camera_config_topic="homeassistant/camera/${device_ident}_snapshot/config"
 
   if [ -z "${camera_name}" ] || [ "${camera_name}" = "null" ]; then
     camera_name="Camera ${camera_id}"
@@ -239,6 +242,18 @@ ensure_discovery_published() {
   mosquitto_pub "${MQTT_ARGS[@]}" -t "${online_config_topic}" -m "${online_payload}" -q 0 || \
     bashio::log.warning "Failed to publish MQTT discovery config for binary_sensor ${device_ident}_online"
 
+  local camera_payload
+  camera_payload=$(jq -nc \
+    --arg name "Vicohome ${camera_name} Snapshot" \
+    --arg uid "${device_ident}_snapshot" \
+    --arg t "${snapshot_topic}" \
+    --arg at "${AVAILABILITY_TOPIC}" \
+    --argjson dev "${device_block}" \
+    '{name:$name, unique_id:$uid, topic:$t, availability_topic:$at, payload_available:"online", payload_not_available:"offline", device:$dev}')
+
+  mosquitto_pub "${MQTT_ARGS[@]}" -t "${camera_config_topic}" -m "${camera_payload}" -q 0 || \
+    bashio::log.warning "Failed to publish MQTT discovery config for camera ${device_ident}_snapshot"
+
   if ! touch "${marker}"; then
     bashio::log.warning "Failed to update discovery marker ${marker}; discovery refresh scheduling may misbehave."
   fi
@@ -257,6 +272,37 @@ publish_event_for_camera() {
     -t "${BASE_TOPIC}/${camera_safe_id}/state" \
     -m "${event_json}" \
     -q 0 || bashio::log.warning "Failed to publish MQTT message for ${BASE_TOPIC}/${camera_safe_id}/state"
+}
+
+publish_camera_snapshot() {
+  local camera_safe_id="$1"
+  local event_json="$2"
+
+  local image_url
+  image_url=$(echo "${event_json}" | jq -r '.imageUrl // .keyShotUrl // .image_url // empty')
+  if [ -z "${image_url}" ]; then
+    return 0
+  fi
+
+  local tmp_img="/tmp/vico_snapshot_${camera_safe_id}.jpg"
+  if ! curl -sS -o "${tmp_img}" -m 15 "${image_url}" 2>/dev/null; then
+    bashio::log.warning "Failed to download snapshot from ${image_url}"
+    rm -f "${tmp_img}"
+    return 0
+  fi
+
+  if [ ! -s "${tmp_img}" ]; then
+    bashio::log.debug "Downloaded snapshot is empty, skipping publish."
+    rm -f "${tmp_img}"
+    return 0
+  fi
+
+  local snapshot_topic="${BASE_TOPIC}/${camera_safe_id}/snapshot"
+  mosquitto_pub "${MQTT_ARGS[@]}" -t "${snapshot_topic}" -f "${tmp_img}" -q 0 || \
+    bashio::log.warning "Failed to publish snapshot for ${snapshot_topic}"
+
+  bashio::log.debug "Published snapshot for ${camera_safe_id} ($(wc -c < "${tmp_img}") bytes)."
+  rm -f "${tmp_img}"
 }
 
 publish_motion_pulse() {
@@ -322,6 +368,7 @@ run_bootstrap_history() {
 
     ensure_discovery_published "${CAMERA_ID}" "${CAMERA_NAME}"
     publish_event_for_camera "${SAFE_ID}" "${event}"
+    publish_camera_snapshot "${SAFE_ID}" "${event}"
 
     if [ "${EVENT_TYPE}" = "motion" ] || [ "${EVENT_TYPE}" = "person" ] || [ "${EVENT_TYPE}" = "human" ] || [ "${EVENT_TYPE}" = "bird" ]; then
       publish_motion_pulse "${SAFE_ID}"
@@ -534,6 +581,7 @@ while true; do
 
       ensure_discovery_published "${CAMERA_ID}" "${CAMERA_NAME}"
       publish_event_for_camera "${SAFE_ID}" "${event}"
+      publish_camera_snapshot "${SAFE_ID}" "${event}"
 
       if [ "${EVENT_TYPE}" = "motion" ] || [ "${EVENT_TYPE}" = "person" ] || [ "${EVENT_TYPE}" = "human" ] || [ "${EVENT_TYPE}" = "bird" ]; then
         bashio::log.debug "Triggering motion pulse for ${SAFE_ID} because event type '${EVENT_TYPE}' requires it."
@@ -564,6 +612,7 @@ while true; do
 
     ensure_discovery_published "${CAMERA_ID}" "${CAMERA_NAME}"
     publish_event_for_camera "${SAFE_ID}" "${event}"
+    publish_camera_snapshot "${SAFE_ID}" "${event}"
 
     if [ "${EVENT_TYPE}" = "motion" ] || [ "${EVENT_TYPE}" = "person" ] || [ "${EVENT_TYPE}" = "human" ] || [ "${EVENT_TYPE}" = "bird" ]; then
       bashio::log.debug "Triggering motion pulse for ${SAFE_ID} because event type '${EVENT_TYPE}' requires it."

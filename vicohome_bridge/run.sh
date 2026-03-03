@@ -284,10 +284,10 @@ run_bootstrap_history() {
 
   bashio::log.info "Running one-time bootstrap history pull from vico-cli..."
 
+  EXIT_CODE=0
   BOOTSTRAP_JSON=$(timeout 120 /usr/local/bin/vico-cli events list \
     --format json \
-    --since 120h 2>/tmp/vico_bootstrap_error.log)
-  EXIT_CODE=$?
+    --since 120h 2>/tmp/vico_bootstrap_error.log) || EXIT_CODE=$?
 
   if [ ${EXIT_CODE} -ne 0 ] || [ -z "${BOOTSTRAP_JSON}" ] || [ "${BOOTSTRAP_JSON}" = "null" ]; then
     bashio::log.warning "Bootstrap history pull failed (exit ${EXIT_CODE}). stderr: $(head -c 200 /tmp/vico_bootstrap_error.log 2>/dev/null)"
@@ -411,8 +411,8 @@ poll_device_health() {
   bashio::log.info "Polling vico-cli for device info..."
 
   local devices_output
-  devices_output=$(timeout 60 /usr/local/bin/vico-cli devices list --format json 2>/tmp/vico_devices_error.log)
-  local exit_code=$?
+  local exit_code=0
+  devices_output=$(timeout 60 /usr/local/bin/vico-cli devices list --format json 2>/tmp/vico_devices_error.log) || exit_code=$?
 
   if [ ${exit_code} -ne 0 ]; then
     bashio::log.warning "vico-cli devices list exited with code ${exit_code}."
@@ -462,8 +462,8 @@ while true; do
   poll_device_health
   bashio::log.info "Polling vico-cli for events..."
 
-  JSON_OUTPUT=$(timeout 60 /usr/local/bin/vico-cli events list --format json 2>/tmp/vico_error.log)
-  EXIT_CODE=$?
+  EXIT_CODE=0
+  JSON_OUTPUT=$(timeout 60 /usr/local/bin/vico-cli events list --format json 2>/tmp/vico_error.log) || EXIT_CODE=$?
 
   if [ ${EXIT_CODE} -ne 0 ]; then
     bashio::log.error "vico-cli exited with code ${EXIT_CODE}."

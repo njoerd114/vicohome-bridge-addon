@@ -14,7 +14,7 @@ startup: services
 boot: auto
 
 services:
-  - mqtt:need
+  - mqtt:want
 
 options:
   email: ""
@@ -25,6 +25,10 @@ options:
   bootstrap_history: true
   region: "auto"
   api_base_override: ""
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
 
 schema:
   email: str
@@ -35,3 +39,7 @@ schema:
   bootstrap_history: bool?
   region: list(auto|us|eu)?
   api_base_override: str?
+  mqtt_host: str?
+  mqtt_port: int(1,65535)?
+  mqtt_username: str?
+  mqtt_password: password?

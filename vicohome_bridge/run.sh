@@ -15,12 +15,20 @@ BASE_TOPIC=$(bashio::config 'base_topic')
 BOOTSTRAP_HISTORY=$(bashio::config 'bootstrap_history')
 REGION=$(bashio::config 'region')
 API_BASE_OVERRIDE=$(bashio::config 'api_base_override')
+MQTT_HOST_OPT=$(bashio::config 'mqtt_host')
+MQTT_PORT_OPT=$(bashio::config 'mqtt_port')
+MQTT_USERNAME_OPT=$(bashio::config 'mqtt_username')
+MQTT_PASSWORD_OPT=$(bashio::config 'mqtt_password')
 
 [ -z "${BOOTSTRAP_HISTORY}" ] && BOOTSTRAP_HISTORY="false"
 HAS_BOOTSTRAPPED="false"
 
 # Defaults
 [ -z "${POLL_INTERVAL}" ] && POLL_INTERVAL=60
+if [ "${POLL_INTERVAL}" -lt 5 ] 2>/dev/null; then
+  bashio::log.warning "poll_interval (${POLL_INTERVAL}s) too low, clamping to 5s to avoid API abuse."
+  POLL_INTERVAL=5
+fi
 [ -z "${LOG_LEVEL}" ] && LOG_LEVEL="info"
 [ -z "${BASE_TOPIC}" ] && BASE_TOPIC="vicohome"
 if [ "${REGION}" = "null" ]; then
@@ -50,32 +58,46 @@ if [ -z "${EMAIL}" ] || [ -z "${PASSWORD}" ]; then
 fi
 
 # ==========================
-#  MQTT service discovery
+#  MQTT connection setup
 # ==========================
-if ! bashio::services.available "mqtt"; then
-  bashio::log.error "MQTT service not available. Make sure the MQTT integration/add-on is set up."
-  exit 1
+# Manual MQTT config takes priority over Supervisor service discovery.
+# If mqtt_host is set, use the user-provided values; otherwise fall back
+# to the HA Supervisor MQTT service (bashio::services mqtt).
+
+if [ -n "${MQTT_HOST_OPT}" ] && [ "${MQTT_HOST_OPT}" != "null" ]; then
+  bashio::log.info "Using manually configured MQTT broker."
+  MQTT_HOST="${MQTT_HOST_OPT}"
+  MQTT_PORT="${MQTT_PORT_OPT:-1883}"
+  MQTT_USERNAME="${MQTT_USERNAME_OPT}"
+  MQTT_PASSWORD="${MQTT_PASSWORD_OPT}"
+else
+  bashio::log.info "No manual MQTT config found, using Supervisor service discovery."
+  if ! bashio::services.available "mqtt"; then
+    bashio::log.error "MQTT service not available and no manual MQTT config set."
+    bashio::log.error "Either install the Mosquitto broker add-on or set mqtt_host in the add-on configuration."
+    exit 1
+  fi
+
+  MQTT_HOST=$(bashio::services mqtt "host")
+  MQTT_PORT=$(bashio::services mqtt "port")
+  MQTT_USERNAME=$(bashio::services mqtt "username")
+  MQTT_PASSWORD=$(bashio::services mqtt "password")
 fi
 
-MQTT_HOST=$(bashio::services mqtt "host")
-MQTT_PORT=$(bashio::services mqtt "port")
-MQTT_USERNAME=$(bashio::services mqtt "username")
-MQTT_PASSWORD=$(bashio::services mqtt "password")
-
-MQTT_ARGS="-h ${MQTT_HOST} -p ${MQTT_PORT}"
-if [ -n "${MQTT_USERNAME}" ] && [ "${MQTT_USERNAME}" != "null" ]; then
-  MQTT_ARGS="${MQTT_ARGS} -u ${MQTT_USERNAME} -P ${MQTT_PASSWORD}"
+MQTT_ARGS=(-h "${MQTT_HOST}" -p "${MQTT_PORT}")
+if [ -n "${MQTT_USERNAME}" ] && [ "${MQTT_USERNAME}" != "null" ] && [ "${MQTT_USERNAME}" != "" ]; then
+  MQTT_ARGS+=(-u "${MQTT_USERNAME}" -P "${MQTT_PASSWORD}")
 fi
 
 bashio::log.info "Using MQTT broker at ${MQTT_HOST}:${MQTT_PORT}, base topic: ${BASE_TOPIC}"
 
 publish_availability() {
   local state="$1"
-  mosquitto_pub ${MQTT_ARGS} -t "${AVAILABILITY_TOPIC}" -m "${state}" -r \
+  mosquitto_pub "${MQTT_ARGS[@]}" -t "${AVAILABILITY_TOPIC}" -m "${state}" -r \
     || bashio::log.warning "Failed to publish availability state '${state}' to ${AVAILABILITY_TOPIC}"
 }
 
-trap 'publish_availability offline' EXIT
+trap 'publish_availability offline; rm -f /tmp/vico_error.log /tmp/vico_devices_error.log /tmp/vico_bootstrap_error.log /tmp/vico_version.log' EXIT
 publish_availability online
 
 # ==========================
@@ -147,51 +169,74 @@ ensure_discovery_published() {
     camera_name="Camera ${camera_id}"
   fi
 
-  # Last Event sensor (state = event type, attributes = full JSON)
-  local sensor_payload
-  sensor_payload=$(cat <<EOF
-{"name":"Vicohome ${camera_name} Last Event","unique_id":"${device_ident}_last_event","state_topic":"${state_topic}","availability_topic":"${AVAILABILITY_TOPIC}","payload_available":"online","payload_not_available":"offline","value_template":"{{ value_json.eventType or value_json.type or value_json.event_type }}","json_attributes_topic":"${state_topic}","device":{"identifiers":["${device_ident}"],"name":"Vicohome ${camera_name}","manufacturer":"Vicohome","model":"Camera"}}
-EOF
-)
+  local device_block
+  device_block=$(jq -nc \
+    --arg ident "${device_ident}" \
+    --arg dname "Vicohome ${camera_name}" \
+    '{identifiers: [$ident], name: $dname, manufacturer: "Vicohome", model: "Camera"}')
 
-  # Motion binary sensor (short pulse on motion/person/bird/human)
+  local sensor_payload
+  sensor_payload=$(jq -nc \
+    --arg name "Vicohome ${camera_name} Last Event" \
+    --arg uid "${device_ident}_last_event" \
+    --arg st "${state_topic}" \
+    --arg at "${AVAILABILITY_TOPIC}" \
+    --arg vt "{{ value_json.eventType or value_json.type or value_json.event_type }}" \
+    --argjson dev "${device_block}" \
+    '{name:$name, unique_id:$uid, state_topic:$st, availability_topic:$at, payload_available:"online", payload_not_available:"offline", value_template:$vt, json_attributes_topic:$st, device:$dev}')
+
   local motion_payload
-  motion_payload=$(cat <<EOF
-{"name":"Vicohome ${camera_name} Motion","unique_id":"${device_ident}_motion","state_topic":"${motion_topic}","availability_topic":"${AVAILABILITY_TOPIC}","payload_available":"online","payload_not_available":"offline","device_class":"motion","payload_on":"ON","payload_off":"OFF","expire_after":30,"device":{"identifiers":["${device_ident}"],"name":"Vicohome ${camera_name}","manufacturer":"Vicohome","model":"Camera"}}
-EOF
-)
+  motion_payload=$(jq -nc \
+    --arg name "Vicohome ${camera_name} Motion" \
+    --arg uid "${device_ident}_motion" \
+    --arg st "${motion_topic}" \
+    --arg at "${AVAILABILITY_TOPIC}" \
+    --argjson dev "${device_block}" \
+    '{name:$name, unique_id:$uid, state_topic:$st, availability_topic:$at, payload_available:"online", payload_not_available:"offline", device_class:"motion", payload_on:"ON", payload_off:"OFF", expire_after:30, device:$dev}')
 
   local battery_payload
-  battery_payload=$(cat <<EOF
-{"name":"Vicohome ${camera_name} Battery","unique_id":"${device_ident}_battery","state_topic":"${telemetry_topic}","availability_topic":"${AVAILABILITY_TOPIC}","payload_available":"online","payload_not_available":"offline","value_template":"{{ value_json.batteryLevel }}","unit_of_measurement":"%","device_class":"battery","state_class":"measurement","device":{"identifiers":["${device_ident}"],"name":"Vicohome ${camera_name}","manufacturer":"Vicohome","model":"Camera"}}
-EOF
-)
+  battery_payload=$(jq -nc \
+    --arg name "Vicohome ${camera_name} Battery" \
+    --arg uid "${device_ident}_battery" \
+    --arg st "${telemetry_topic}" \
+    --arg at "${AVAILABILITY_TOPIC}" \
+    --arg vt "{{ value_json.batteryLevel }}" \
+    --argjson dev "${device_block}" \
+    '{name:$name, unique_id:$uid, state_topic:$st, availability_topic:$at, payload_available:"online", payload_not_available:"offline", value_template:$vt, unit_of_measurement:"%", device_class:"battery", state_class:"measurement", device:$dev}')
 
   local wifi_payload
-  wifi_payload=$(cat <<EOF
-{"name":"Vicohome ${camera_name} WiFi","unique_id":"${device_ident}_wifi","state_topic":"${telemetry_topic}","availability_topic":"${AVAILABILITY_TOPIC}","payload_available":"online","payload_not_available":"offline","value_template":"{{ value_json.signalStrength }}","unit_of_measurement":"dBm","device_class":"signal_strength","state_class":"measurement","entity_category":"diagnostic","device":{"identifiers":["${device_ident}"],"name":"Vicohome ${camera_name}","manufacturer":"Vicohome","model":"Camera"}}
-EOF
-)
+  wifi_payload=$(jq -nc \
+    --arg name "Vicohome ${camera_name} WiFi" \
+    --arg uid "${device_ident}_wifi" \
+    --arg st "${telemetry_topic}" \
+    --arg at "${AVAILABILITY_TOPIC}" \
+    --arg vt "{{ value_json.signalStrength }}" \
+    --argjson dev "${device_block}" \
+    '{name:$name, unique_id:$uid, state_topic:$st, availability_topic:$at, payload_available:"online", payload_not_available:"offline", value_template:$vt, unit_of_measurement:"dBm", device_class:"signal_strength", state_class:"measurement", entity_category:"diagnostic", device:$dev}')
 
   local online_payload
-  online_payload=$(cat <<EOF
-{"name":"Vicohome ${camera_name} Online","unique_id":"${device_ident}_online","state_topic":"${telemetry_topic}","availability_topic":"${AVAILABILITY_TOPIC}","payload_available":"online","payload_not_available":"offline","value_template":"{% if value_json.online %}ON{% else %}OFF{% endif %}","payload_on":"ON","payload_off":"OFF","device_class":"connectivity","entity_category":"diagnostic","device":{"identifiers":["${device_ident}"],"name":"Vicohome ${camera_name}","manufacturer":"Vicohome","model":"Camera"}}
-EOF
-)
+  online_payload=$(jq -nc \
+    --arg name "Vicohome ${camera_name} Online" \
+    --arg uid "${device_ident}_online" \
+    --arg st "${telemetry_topic}" \
+    --arg at "${AVAILABILITY_TOPIC}" \
+    --arg vt '{% if value_json.online %}ON{% else %}OFF{% endif %}' \
+    --argjson dev "${device_block}" \
+    '{name:$name, unique_id:$uid, state_topic:$st, availability_topic:$at, payload_available:"online", payload_not_available:"offline", value_template:$vt, payload_on:"ON", payload_off:"OFF", device_class:"connectivity", entity_category:"diagnostic", device:$dev}')
 
-  mosquitto_pub ${MQTT_ARGS} -t "${sensor_topic}" -m "${sensor_payload}" -q 0 || \
+  mosquitto_pub "${MQTT_ARGS[@]}" -t "${sensor_topic}" -m "${sensor_payload}" -q 0 || \
     bashio::log.warning "Failed to publish MQTT discovery config for sensor ${device_ident}_last_event"
 
-  mosquitto_pub ${MQTT_ARGS} -t "${motion_config_topic}" -m "${motion_payload}" -q 0 || \
+  mosquitto_pub "${MQTT_ARGS[@]}" -t "${motion_config_topic}" -m "${motion_payload}" -q 0 || \
     bashio::log.warning "Failed to publish MQTT discovery config for binary_sensor ${device_ident}_motion"
 
-  mosquitto_pub ${MQTT_ARGS} -t "${battery_config_topic}" -m "${battery_payload}" -q 0 || \
+  mosquitto_pub "${MQTT_ARGS[@]}" -t "${battery_config_topic}" -m "${battery_payload}" -q 0 || \
     bashio::log.warning "Failed to publish MQTT discovery config for sensor ${device_ident}_battery"
 
-  mosquitto_pub ${MQTT_ARGS} -t "${wifi_config_topic}" -m "${wifi_payload}" -q 0 || \
+  mosquitto_pub "${MQTT_ARGS[@]}" -t "${wifi_config_topic}" -m "${wifi_payload}" -q 0 || \
     bashio::log.warning "Failed to publish MQTT discovery config for sensor ${device_ident}_wifi"
 
-  mosquitto_pub ${MQTT_ARGS} -t "${online_config_topic}" -m "${online_payload}" -q 0 || \
+  mosquitto_pub "${MQTT_ARGS[@]}" -t "${online_config_topic}" -m "${online_payload}" -q 0 || \
     bashio::log.warning "Failed to publish MQTT discovery config for binary_sensor ${device_ident}_online"
 
   if ! touch "${marker}"; then
@@ -203,12 +248,12 @@ publish_event_for_camera() {
   local camera_safe_id="$1"
   local event_json="$2"
 
-  mosquitto_pub ${MQTT_ARGS} \
+  mosquitto_pub "${MQTT_ARGS[@]}" \
     -t "${BASE_TOPIC}/${camera_safe_id}/events" \
     -m "${event_json}" \
     -q 0 || bashio::log.warning "Failed to publish MQTT message for ${BASE_TOPIC}/${camera_safe_id}/events"
 
-  mosquitto_pub ${MQTT_ARGS} \
+  mosquitto_pub "${MQTT_ARGS[@]}" \
     -t "${BASE_TOPIC}/${camera_safe_id}/state" \
     -m "${event_json}" \
     -q 0 || bashio::log.warning "Failed to publish MQTT message for ${BASE_TOPIC}/${camera_safe_id}/state"
@@ -218,14 +263,14 @@ publish_motion_pulse() {
   local camera_safe_id="$1"
   local motion_topic="${BASE_TOPIC}/${camera_safe_id}/motion"
 
-  mosquitto_pub ${MQTT_ARGS} \
+  mosquitto_pub "${MQTT_ARGS[@]}" \
     -t "${motion_topic}" \
     -m "ON" \
     -q 0 || bashio::log.warning "Failed to publish motion ON for ${motion_topic}"
 
   (
     sleep 5
-    mosquitto_pub ${MQTT_ARGS} \
+    mosquitto_pub "${MQTT_ARGS[@]}" \
       -t "${motion_topic}" \
       -m "OFF" \
       -q 0 || bashio::log.warning "Failed to publish motion OFF for ${motion_topic}"
@@ -239,7 +284,7 @@ run_bootstrap_history() {
 
   bashio::log.info "Running one-time bootstrap history pull from vico-cli..."
 
-  BOOTSTRAP_JSON=$(/usr/local/bin/vico-cli events list \
+  BOOTSTRAP_JSON=$(timeout 120 /usr/local/bin/vico-cli events list \
     --format json \
     --since 120h 2>/tmp/vico_bootstrap_error.log)
   EXIT_CODE=$?
@@ -356,7 +401,7 @@ publish_device_health() {
   bashio::log.debug "Telemetry payload for ${safe_id}: ${telemetry_payload}"
 
   local telemetry_topic="${BASE_TOPIC}/${safe_id}/telemetry"
-  mosquitto_pub ${MQTT_ARGS} \
+  mosquitto_pub "${MQTT_ARGS[@]}" \
     -t "${telemetry_topic}" \
     -m "${telemetry_payload}" \
     -q 0 || bashio::log.warning "Failed to publish telemetry for ${telemetry_topic}"
@@ -366,7 +411,7 @@ poll_device_health() {
   bashio::log.info "Polling vico-cli for device info..."
 
   local devices_output
-  devices_output=$(/usr/local/bin/vico-cli devices list --format json 2>/tmp/vico_devices_error.log)
+  devices_output=$(timeout 60 /usr/local/bin/vico-cli devices list --format json 2>/tmp/vico_devices_error.log)
   local exit_code=$?
 
   if [ ${exit_code} -ne 0 ]; then
@@ -417,7 +462,7 @@ while true; do
   poll_device_health
   bashio::log.info "Polling vico-cli for events..."
 
-  JSON_OUTPUT=$(/usr/local/bin/vico-cli events list --format json 2>/tmp/vico_error.log)
+  JSON_OUTPUT=$(timeout 60 /usr/local/bin/vico-cli events list --format json 2>/tmp/vico_error.log)
   EXIT_CODE=$?
 
   if [ ${EXIT_CODE} -ne 0 ]; then
@@ -437,13 +482,6 @@ while true; do
   if [ ${EXIT_CODE} -eq 0 ] && echo "${JSON_OUTPUT}" | grep -q "No events found"; then
     bashio::log.info "vico-cli reported no events in the recent window."
     run_bootstrap_history
-    sleep "${POLL_INTERVAL}"
-    continue
-  fi
-
-  if [ ${EXIT_CODE} -eq 0 ] && echo "${JSON_OUTPUT}" | grep -q "No events found"; then
-    bashio::log.info "vico-cli reported no events in the recent window."
-    bootstrap_history_if_needed
     sleep "${POLL_INTERVAL}"
     continue
   fi

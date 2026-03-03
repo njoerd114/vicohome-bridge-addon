@@ -284,35 +284,48 @@ run_bootstrap_history() {
 
   bashio::log.info "Running one-time bootstrap history pull from vico-cli..."
 
-  EXIT_CODE=0
-  BOOTSTRAP_JSON=$(timeout 120 /usr/local/bin/vico-cli events list \
+  # Write to temp file instead of bash variable to avoid OOM on large histories.
+  local exit_code=0
+  timeout 120 /usr/local/bin/vico-cli events list \
     --format json \
-    --since 120h 2>/tmp/vico_bootstrap_error.log) || EXIT_CODE=$?
+    --since 120h \
+    > /tmp/vico_bootstrap.json 2>/tmp/vico_bootstrap_error.log || exit_code=$?
 
-  if [ ${EXIT_CODE} -ne 0 ] || [ -z "${BOOTSTRAP_JSON}" ] || [ "${BOOTSTRAP_JSON}" = "null" ]; then
-    bashio::log.warning "Bootstrap history pull failed (exit ${EXIT_CODE}). stderr: $(head -c 200 /tmp/vico_bootstrap_error.log 2>/dev/null)"
+  local output_size
+  output_size=$(wc -c < /tmp/vico_bootstrap.json 2>/dev/null || echo 0)
+  bashio::log.debug "Bootstrap vico-cli exited ${exit_code}, output ${output_size} bytes."
+
+  if [ ${exit_code} -ne 0 ] || [ ! -s /tmp/vico_bootstrap.json ]; then
+    bashio::log.warning "Bootstrap history pull failed (exit ${exit_code}). stderr: $(head -c 200 /tmp/vico_bootstrap_error.log 2>/dev/null)"
     HAS_BOOTSTRAPPED="true"
+    rm -f /tmp/vico_bootstrap.json
     return 0
   fi
 
-  if echo "${BOOTSTRAP_JSON}" | jq -e 'type=="array"' >/dev/null 2>&1; then
-    echo "${BOOTSTRAP_JSON}" | jq -c '.[]' | while read -r event; do
-      CAMERA_ID=$(echo "${event}" | jq -r '.serialNumber // .deviceId // .device_id // .camera_id // .camera.uuid // .cameraId // empty')
-      [ -z "${CAMERA_ID}" ] && continue
-
-      SAFE_ID=$(sanitize_id "${CAMERA_ID}")
-      CAMERA_NAME=$(echo "${event}" | jq -r '.deviceName // .camera_name // .camera.name // .cameraName // .title // empty')
-      EVENT_TYPE=$(echo "${event}" | jq -r '.eventType // .type // .event_type // empty')
-
-      ensure_discovery_published "${CAMERA_ID}" "${CAMERA_NAME}"
-      publish_event_for_camera "${SAFE_ID}" "${event}"
-
-      if [ "${EVENT_TYPE}" = "motion" ] || [ "${EVENT_TYPE}" = "person" ] || [ "${EVENT_TYPE}" = "human" ] || [ "${EVENT_TYPE}" = "bird" ]; then
-        publish_motion_pulse "${SAFE_ID}"
-      fi
-    done
+  if ! jq -e 'type=="array"' /tmp/vico_bootstrap.json >/dev/null 2>&1; then
+    bashio::log.warning "Bootstrap output is not a JSON array, skipping. Preview: $(head -c 200 /tmp/vico_bootstrap.json 2>/dev/null)"
+    HAS_BOOTSTRAPPED="true"
+    rm -f /tmp/vico_bootstrap.json
+    return 0
   fi
 
+  jq -c '.[]' /tmp/vico_bootstrap.json | while read -r event; do
+    CAMERA_ID=$(echo "${event}" | jq -r '.serialNumber // .deviceId // .device_id // .camera_id // .camera.uuid // .cameraId // empty')
+    [ -z "${CAMERA_ID}" ] && continue
+
+    SAFE_ID=$(sanitize_id "${CAMERA_ID}")
+    CAMERA_NAME=$(echo "${event}" | jq -r '.deviceName // .camera_name // .camera.name // .cameraName // .title // empty')
+    EVENT_TYPE=$(echo "${event}" | jq -r '.eventType // .type // .event_type // empty')
+
+    ensure_discovery_published "${CAMERA_ID}" "${CAMERA_NAME}"
+    publish_event_for_camera "${SAFE_ID}" "${event}"
+
+    if [ "${EVENT_TYPE}" = "motion" ] || [ "${EVENT_TYPE}" = "person" ] || [ "${EVENT_TYPE}" = "human" ] || [ "${EVENT_TYPE}" = "bird" ]; then
+      publish_motion_pulse "${SAFE_ID}"
+    fi
+  done
+
+  rm -f /tmp/vico_bootstrap.json
   HAS_BOOTSTRAPPED="true"
 }
 

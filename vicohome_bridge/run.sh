@@ -285,10 +285,13 @@ run_bootstrap_history() {
   bashio::log.info "Running one-time bootstrap history pull from vico-cli..."
 
   # Write to temp file instead of bash variable to avoid OOM on large histories.
+  local start_time
+  start_time=$(date -u -d "@$(($(date +%s) - 432000))" '+%Y-%m-%d %H:%M:%S')
   local exit_code=0
+  bashio::log.debug "Bootstrap startTime: ${start_time}"
   timeout 120 /usr/local/bin/vico-cli events list \
     --format json \
-    --since 120h \
+    --startTime "${start_time}" \
     > /tmp/vico_bootstrap.json 2>/tmp/vico_bootstrap_error.log || exit_code=$?
 
   local output_size
